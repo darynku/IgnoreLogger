@@ -1,0 +1,268 @@
+﻿internal sealed class GlobalExceptionHandler : IExceptionHandler
+{
+    private readonly ILogger<GlobalExceptionHandler> _logger;
+
+    public GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logger)
+    {
+        _logger = logger;
+    }
+
+    public async ValueTask<bool> TryHandleAsync(
+    HttpContext httpContext,
+    Exception exception,
+    CancellationToken cancellationToken)
+{
+    System.Diagnostics.Debug.WriteLine("GlobalExceptionHandler.TryHandleAsync called");
+
+    var method = httpContext.Request.Method;
+    var path = httpContext.Request.Path;
+    var contentType = httpContext.Request.ContentType;
+    var contentLength = httpContext.Request.ContentLength;
+
+    System.Diagnostics.Debug.WriteLine($"Request: Method={method}, Path={path}, ContentType={contentType}, ContentLength={contentLength}, CanRead={httpContext.Request.Body.CanRead}, CanSeek={httpContext.Request.Body.CanSeek}");
+
+    // Проверка размера тела запроса
+    const long maxBodySize = 1024 * 1024; // 1 MB
+    if (contentLength > maxBodySize)
+    {
+        _logger.LogError(
+            exception,
+            "Exception occurred. Body: [Body too large to log], Method: {Method}, Path: {Path}, ContentType: {ContentType}, ContentLength: {ContentLength}",
+            method,
+            path,
+            contentType,
+            contentLength);
+    }
+    else
+    {
+        var bodyContent = await ReadRequestBodyAsync(httpContext.Request);
+        var bodyObject = TryDeserializeBody(httpContext, bodyContent);
+
+        if (bodyContent == null)
+        {
+            System.Diagnostics.Debug.WriteLine($"BodyContent is null. ContentType: {contentType}, ContentLength: {contentLength}");
+        }
+        if (bodyObject == null && bodyContent != null)
+        {
+            System.Diagnostics.Debug.WriteLine($"BodyObject is null but BodyContent is not null: {bodyContent}");
+        }
+
+        // Фильтруем поля с [IgnoreLogger] для словаря
+        Type? modelType = httpContext.Items["ModelType"] as Type;
+        if (bodyObject is Dictionary<string, object> dict && modelType != null)
+        {
+            var filteredDict = new Dictionary<string, object>();
+            foreach (var kvp in dict)
+            {
+                if (!kvp.Key.Equals("$modelType", StringComparison.OrdinalIgnoreCase) && !IsIgnoredProperty(modelType, kvp.Key))
+                {
+                    filteredDict[kvp.Key] = kvp.Value;
+                }
+            }
+            bodyObject = filteredDict;
+            System.Diagnostics.Debug.WriteLine($"Filtered dictionary for logging: {string.Join(", ", filteredDict.Keys)}");
+        }
+
+        _logger.LogError(
+            exception,
+            "Exception occurred. Body: {@Body}, RawBody: {RawBody}, Method: {Method}, Path: {Path}, ContentType: {ContentType}, ContentLength: {ContentLength}",
+            bodyObject,
+            bodyContent ?? "null",
+            method,
+            path,
+            contentType,
+            contentLength);
+    }
+
+    var problemDetails = new ProblemDetails
+    {
+        Status = StatusCodes.Status500InternalServerError,
+        Title = "Server error"
+    };
+
+    httpContext.Response.StatusCode = problemDetails.Status.Value;
+
+    await httpContext.Response
+        .WriteAsJsonAsync(problemDetails, cancellationToken);
+
+    return true;
+}
+    private static async Task<string?> ReadRequestBodyAsync(HttpRequest request) 
+    {
+        WriteLine($"ReadRequestBodyAsync: CanRead={request.Body.CanRead}, CanSeek={request.Body.CanSeek}, Position={request.Body.Position}, Length={(request.Body.CanSeek ? request.Body.Length : -1)}");
+
+        if (!request.Body.CanRead)
+        {
+            WriteLine("Request body cannot be read");
+            return null;
+        }
+
+        // Включаем буферизацию
+        request.EnableBuffering();
+        WriteLine($"Buffering enabled. CanSeek={request.Body.CanSeek}, Position={request.Body.Position}");
+
+        try
+        {
+            // Сбрасываем позицию потока, если это возможно
+            if (request.Body.CanSeek && request.Body.Position != 0)
+            {
+                WriteLine($"Resetting stream position from {request.Body.Position} to 0");
+                request.Body.Position = 0;
+            }
+
+            // Копируем тело в MemoryStream
+            using var memoryStream = new MemoryStream();
+            await request.Body.CopyToAsync(memoryStream);
+            WriteLine($"MemoryStream Length: {memoryStream.Length}");
+
+            if (memoryStream.Length == 0)
+            {
+                WriteLine("Request body is empty (MemoryStream is empty)");
+                return null;
+            }
+
+            memoryStream.Position = 0;
+            using var reader = new StreamReader(memoryStream, Encoding.UTF8);
+            var bodyString = await reader.ReadToEndAsync();
+
+            if (string.IsNullOrWhiteSpace(bodyString))
+            {
+                WriteLine("Request body is empty after reading");
+                return null;
+            }
+
+            WriteLine($"Read body: {bodyString}");
+            return bodyString;
+        }
+        catch (Exception ex)
+        {
+            WriteLine($"Error reading request body: {ex.Message}, StackTrace: {ex.StackTrace}");
+            return null;
+        }
+        finally
+        {
+            // Проверяем состояние потока после попытки чтения
+            WriteLine($"After reading: CanRead={request.Body.CanRead}, CanSeek={request.Body.CanSeek}, Position={request.Body.Position}");
+        }
+    }
+
+private object? TryDeserializeBody(HttpContext httpContext, string? bodyString)
+{
+    if (string.IsNullOrWhiteSpace(bodyString))
+    {
+        System.Diagnostics.Debug.WriteLine("Body string is empty or null");
+        return null;
+    }
+
+    // Проверяем Content-Type
+    var contentType = httpContext.Request.ContentType;
+    if (string.IsNullOrEmpty(contentType) || !contentType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
+    {
+        System.Diagnostics.Debug.WriteLine($"Unsupported Content-Type: {contentType}");
+        return bodyString;
+    }
+
+    // Пытаемся получить modelType из HttpContext.Items
+    Type? modelType = httpContext.Items["ModelType"] as Type;
+    if (modelType != null)
+    {
+        System.Diagnostics.Debug.WriteLine($"ModelType found in HttpContext.Items: {modelType.Name}");
+    }
+    else
+    {
+        System.Diagnostics.Debug.WriteLine("No ModelType found in HttpContext.Items");
+    }
+
+    // Пытаемся десериализовать в modelType, если он найден
+    if (modelType != null)
+    {
+        try
+        {
+            var result = JsonSerializer.Deserialize(bodyString, modelType, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            });
+            System.Diagnostics.Debug.WriteLine($"Deserialized to type: {modelType.Name}");
+            return result;
+        }
+        catch (JsonException ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Deserialization failed for type {modelType.Name}, JSON: {bodyString}, ContentType: {contentType}, Error: {ex.Message}");
+        }
+    }
+
+    // Запасной вариант: десериализация в словарь
+    try
+    {
+        var dict = JsonSerializer.Deserialize<Dictionary<string, object>>(bodyString, new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        });
+
+        if (dict != null)
+        {
+            var filteredDict = new Dictionary<string, object>();
+            if (modelType != null)
+            {
+                filteredDict["$modelType"] = modelType;
+                foreach (var kvp in dict)
+                {
+                    if (kvp.Key.Equals("$type", StringComparison.OrdinalIgnoreCase) ||
+                        kvp.Key.Equals("ValueKind", StringComparison.OrdinalIgnoreCase) ||
+                        kvp.Key.Equals("Comparer", StringComparison.OrdinalIgnoreCase) ||
+                        kvp.Key.Equals("Keys", StringComparison.OrdinalIgnoreCase) ||
+                        kvp.Key.Equals("Values", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (!IsIgnoredProperty(modelType, kvp.Key))
+                    {
+                        filteredDict[kvp.Key] = NormalizeValue(kvp.Value);
+                    }
+                }
+            }
+            else
+            {
+                filteredDict = dict; // Без modelType включаем все поля
+            }
+            System.Diagnostics.Debug.WriteLine($"Deserialized to dictionary: {string.Join(", ", filteredDict.Keys)}");
+            return filteredDict;
+        }
+    }
+    catch (JsonException ex)
+    {
+        System.Diagnostics.Debug.WriteLine($"JSON parsing failed: {bodyString}, ContentType: {contentType}, Error: {ex.Message}");
+        return bodyString;
+    }
+
+    System.Diagnostics.Debug.WriteLine($"Deserialization returned null for JSON: {bodyString}, ContentType: {contentType}");
+    return null;
+}
+    private bool IsIgnoredProperty(Type type, string key)
+    {
+        var property = type.GetProperty(key, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+        var isIgnored = property != null && property.GetCustomAttribute<IgnoreLoggerAttribute>(inherit: false) != null;
+        WriteLine($"IsIgnoredProperty: Type={type.Name}, Key={key}, PropertyFound={property != null}, IsIgnored={isIgnored}");
+        return isIgnored;
+    }
+
+    private object? NormalizeValue(object? value)
+    {
+        if (value is JsonElement jsonElement)
+        {
+            return jsonElement.ValueKind switch
+            {
+                JsonValueKind.String => jsonElement.GetString(),
+                JsonValueKind.Number => jsonElement.TryGetInt64(out long l) ? l : jsonElement.GetDouble(),
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.Null => null,
+                JsonValueKind.Array => jsonElement.EnumerateArray().Select(e => NormalizeValue(e)).ToList(),
+                JsonValueKind.Object => jsonElement.EnumerateObject()
+                    .ToDictionary(p => p.Name, p => NormalizeValue(p.Value)),
+                _ => jsonElement.ToString()
+            };
+        }
+        return value;
+    }
+}

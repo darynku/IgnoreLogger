@@ -1,0 +1,112 @@
+﻿using System.Diagnostics;
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Http.Metadata;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Abstractions;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
+using Serilog;
+using Serilog.Core;
+using WebApplication2;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+builder.Services.AddAntiforgery();
+
+builder.Services.AddProblemDetails();
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+
+builder.Host.UseSerilog(
+    new LoggerConfiguration()
+        .Destructure.With<IgnoreLoggerDestructuringPolicy>()
+        .WriteTo.Console()
+        .CreateLogger());
+
+var app = builder.Build();
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseExceptionHandler();
+
+app.UseRouting();
+app.UseAntiforgery();
+app.Use(async (context, next) =>
+{
+    context.Request.EnableBuffering();
+    Debug.WriteLine($"Enabled buffering for request: {context.Request.Path}, CanSeek={context.Request.Body.CanSeek}");
+    await next(context);
+});
+
+// Явно используем ExceptionHandler
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var exceptionHandlerFeature = context.Features.Get<IExceptionHandlerFeature>();
+        if (exceptionHandlerFeature != null)
+        {
+            Debug.WriteLine("ExceptionHandler middleware processing exception");
+            // Делегируем обработку зарегистрированному IExceptionHandler
+            var handler = context.RequestServices.GetService<IExceptionHandler>();
+            if (handler != null)
+            {
+                await handler.TryHandleAsync(context, exceptionHandlerFeature.Error, CancellationToken.None);
+            }
+        }
+    });
+});
+
+app.MapPost("/post", (TestDto test) =>
+{
+    throw new Exception();
+})
+.WithName("UploadFile")
+.DisableAntiforgery()
+.WithOpenApi();
+
+app.Use(async (context, next) =>
+{
+    var endpoint = context.GetEndpoint();
+    if (endpoint != null)
+    {
+        var routeEndpoint = endpoint as RouteEndpoint;
+        if (routeEndpoint?.RoutePattern.Parameters != null)
+        {
+            var parameters = routeEndpoint.Metadata.GetMetadata<ParameterDescriptor[]>();
+            foreach (var param in parameters)
+            {
+                if (!param.ParameterType.IsPrimitive && param.ParameterType != typeof(string) && param.ParameterType != typeof(HttpContext) && param.ParameterType != typeof(CancellationToken))
+                {
+                    context.Items["ModelType"] = param.ParameterType;
+                    Debug.WriteLine($"Stored ModelType via reflection: {param.ParameterType.Name}");
+                    break;
+                }
+            }
+        }
+    }
+    await next(context);
+});
+
+app.UseHttpsRedirection();
+app.Run();
+
+public class TestDto
+{
+    [IgnoreLogger]
+    public string Username { get; set; }
+    
+    [IgnoreLogger]
+    public string Name { get; set; }
+}
+internal class Test
+{
+    [IgnoreLogger]
+    public Guid Id { get; set; }
+    public string Username { get; set; }
+    public string Name { get; set; }
+}
