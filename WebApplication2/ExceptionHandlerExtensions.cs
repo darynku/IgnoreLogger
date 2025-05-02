@@ -4,7 +4,6 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
-using static System.Diagnostics.Debug;
 
 namespace WebApplication2;
 
@@ -15,10 +14,7 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
     // Поля, которые всегда будут маскироваться, независимо от наличия атрибута
     private static readonly HashSet<string> DefaultSensitiveFields = new(StringComparer.OrdinalIgnoreCase)
     {
-        "password", "pwd", "secret", "key", "token", "apikey", "api_key", 
-        "accesstoken", "access_token", "refreshtoken", "refresh_token",
-        "credential", "pin", "passcode", "pass", "privatekey", "private_key",
-        "file", "files", "attachment", "upload", "document", "binary", "content", "stream"
+        "file", "files" // Оставляем только поля, связанные с файлами
     };
 
     public GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logger)
@@ -31,30 +27,110 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
     Exception exception,
     CancellationToken cancellationToken)
 {
+        try
+        {
     var method = httpContext.Request.Method;
     var path = httpContext.Request.Path;
     var contentType = httpContext.Request.ContentType;
 
-        // Загружаем тело запроса
-        string? bodyContent = await ReadRequestBodyAsync(httpContext.Request);
+            // Переменная для логирования тела запроса
+            string? bodyContent = null;
 
-        // Маскируем конфиденциальные поля в JSON
-        if (!string.IsNullOrWhiteSpace(bodyContent) && 
-            contentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            bodyContent = MaskSensitiveFieldsInJson(bodyContent);
-        }
+            // Определяем главный тип содержимого (до первого ';')
+            string? mainContentType = contentType?.Split(';').FirstOrDefault()?.Trim().ToLowerInvariant();
 
-        // Логируем исключение вместе с данными запроса
+            // Обрабатываем по-разному в зависимости от типа контента
+            if (mainContentType == "application/json")
+            {
+                // Для JSON используем исходную логику
+                bodyContent = await ReadRequestBodyAsync(httpContext.Request);
+                if (!string.IsNullOrWhiteSpace(bodyContent))
+                {
+                    try
+                    {
+                        // Проверяем, является ли bodyContent валидным JSON
+                        using var doc = JsonDocument.Parse(bodyContent);
+                        // Если дошли сюда, значит это валидный JSON
+                        bodyContent = MaskSensitiveFieldsInJson(bodyContent);
+                    }
+                    catch (JsonException)
+                    {
+                        // Если это не валидный JSON, оставляем как есть
+                    }
+                }
+            }
+            else if (mainContentType == "multipart/form-data")
+            {
+                // Для form-data создаем JSON из формы, исключая файлы
+                try
+                {
+                    // Получаем данные формы
+                    var form = await httpContext.Request.ReadFormAsync(cancellationToken);
+                    
+                    // Собираем не-файловые поля в словарь
+                    var formData = new Dictionary<string, object>();
+                    
+                    // Сначала обработаем обычные поля формы (не файлы)
+                    foreach (var key in form.Keys)
+                    {
+                        // Если поле не является файлом
+                        if (!form.Files.Any(f => f.Name == key))
+                        {
+                            // Проверяем, является ли поле чувствительным
+                            if (!IsSensitiveProperty(key, GetSensitiveFieldNames()))
+                            {
+                                // Добавляем значение поля в JSON
+                                formData[key] = form[key].ToString();
+                            }
+                        }
+                    }
+                    
+                    // Добавляем информацию о файлах (только имена и размеры)
+                    var fileInfos = new List<object>();
+                    foreach (var file in form.Files)
+                    {
+                        // Включаем только безопасную информацию о файлах
+                        fileInfos.Add(new
+                        {
+                            FieldName = file.Name,
+                            FilePresent = true,
+                            Size = file.Length,
+                            ContentType = file.ContentType
+                        });
+                    }
+                    
+                    if (fileInfos.Any())
+                    {
+                        formData["_fileInfo"] = fileInfos;
+                    }
+                    
+                    // Серилизуем в JSON
+                    bodyContent = JsonSerializer.Serialize(formData, new JsonSerializerOptions
+                    {
+                        WriteIndented = true
+                    });
+                }
+                catch (Exception ex)
+                {
+                    bodyContent = $"[Error processing multipart form data: {ex.Message}]";
+                }
+            }
+            else
+            {
+                // Для других типов контента просто читаем тело запроса
+                bodyContent = await ReadRequestBodyAsync(httpContext.Request);
+            }
+
+            // Логируем исключение вместе с данными запроса
         _logger.LogError(
             exception,
-            "Exception occurred. RawBody: {RawBody}, Method: {Method}, Path: {Path}, ContentType: {ContentType}",
-            bodyContent ?? "[No body]",
+                "Exception occurred. RawBody: {RawBody}, Method: {Method}, Path: {Path}, ContentType: {ContentType}",
+                bodyContent ?? "[No body]",
             method,
             path,
-            contentType);
+                contentType);
 
-        // Возвращаем стандартный ответ об ошибке
+            // Возвращаем стандартный ответ об ошибке
     var problemDetails = new ProblemDetails
     {
         Status = StatusCodes.Status500InternalServerError,
@@ -62,21 +138,82 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
     };
 
     httpContext.Response.StatusCode = problemDetails.Status.Value;
-        await httpContext.Response.WriteAsJsonAsync(problemDetails, cancellationToken);
+            await httpContext.Response.WriteAsJsonAsync(problemDetails, cancellationToken);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // Логируем ошибку в обработчике исключений
+            _logger.LogError(ex, "Error in exception handler itself");
+            
+            // Возвращаем минимальный ответ об ошибке
+            httpContext.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            await httpContext.Response.WriteAsync("Server error occurred", cancellationToken);
 
     return true;
 }
+    }
+
+    /// <summary>
+    /// Получает имена всех полей, помеченных атрибутом IgnoreLogger в приложении
+    /// </summary>
+    private HashSet<string> GetSensitiveFieldNames()
+    {
+        var sensitiveFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        
+        // Добавляем поля, связанные с файлами
+        sensitiveFields.Add("file");
+        sensitiveFields.Add("files");
+        
+        // Добавляем поля, помеченные атрибутом IgnoreLogger
+        var annotatedTypes = from a in AppDomain.CurrentDomain.GetAssemblies()
+                             from t in a.GetTypes()
+                             where t.IsClass && !t.IsAbstract && t.GetProperties()
+                                   .Any(p => p.GetCustomAttribute<IgnoreLoggerAttribute>() != null)
+                             select t;
+
+        foreach (var type in annotatedTypes)
+        {
+            var ignoredProps = type.GetProperties()
+                .Where(p => p.GetCustomAttribute<IgnoreLoggerAttribute>() != null)
+                .Select(p => p.Name.ToLowerInvariant());
+            
+            foreach (var prop in ignoredProps)
+            {
+                sensitiveFields.Add(prop);
+            }
+        }
+        
+        return sensitiveFields;
+    }
 
     private static async Task<string?> ReadRequestBodyAsync(HttpRequest request) 
     {
+        // Проверяем тип контента (берем основной тип, без параметров)
+        string? mainContentType = request.ContentType?.Split(';').FirstOrDefault()?.Trim().ToLowerInvariant();
+        
+        // Для multipart/form-data не читаем содержимое, чтобы избежать проблем с потоками
+        if (mainContentType == "multipart/form-data")
+        {
+            return "[form-data content - not read for security reasons]";
+        }
+
         if (!request.Body.CanRead)
             return null;
 
-        request.EnableBuffering();
+        // Для application/json и других типов нужна буферизация
+        if (mainContentType == "application/json" || (mainContentType != null && !mainContentType.Contains("multipart")))
+        {
+            // Включаем буферизацию для повторного чтения тела
+            request.EnableBuffering();
+        }
 
         try
         {
+            // Только если поток поддерживает позиционирование и не является form-data
             if (request.Body.CanSeek)
+            {
                 request.Body.Position = 0;
 
             using var memoryStream = new MemoryStream();
@@ -87,18 +224,22 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
 
             memoryStream.Position = 0;
             using var reader = new StreamReader(memoryStream, Encoding.UTF8);
-            var bodyContent = await reader.ReadToEndAsync();
-
-            return string.IsNullOrWhiteSpace(bodyContent) ? null : bodyContent;
+                var bodyContent = await reader.ReadToEndAsync();
+                
+                // Сбрасываем позицию для последующих чтений
+                request.Body.Position = 0;
+                
+                return string.IsNullOrWhiteSpace(bodyContent) ? null : bodyContent;
+            }
+            else
+            {
+                // Для потоков, которые не поддерживают позиционирование, выводим информационное сообщение
+                return "[Request body can't be read - stream doesn't support seeking]";
+            }
         }
         catch
         {
-            return null;
-        }
-        finally
-        {
-            if (request.Body.CanSeek)
-                request.Body.Position = 0;
+            return "[Error reading request body]";
         }
     }
 
@@ -108,35 +249,13 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
     /// </summary>
     private string MaskSensitiveFieldsInJson(string json)
     {
+        if (string.IsNullOrWhiteSpace(json))
+            return json;
+            
         try
         {
             // Собираем все имена полей, которые нужно маскировать
-            var fieldsToMask = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            
-            // Добавляем стандартные чувствительные поля
-            foreach (var field in DefaultSensitiveFields)
-            {
-                fieldsToMask.Add(field);
-            }
-            
-            // Добавляем поля с атрибутом IgnoreLogger
-            var annotatedTypes = from a in AppDomain.CurrentDomain.GetAssemblies()
-                               from t in a.GetTypes()
-                               where t.IsClass && !t.IsAbstract && t.GetProperties()
-                                     .Any(p => p.GetCustomAttribute<IgnoreLoggerAttribute>() != null)
-                               select t;
-
-            foreach (var type in annotatedTypes)
-            {
-                var sensitiveProps = type.GetProperties()
-                    .Where(p => p.GetCustomAttribute<IgnoreLoggerAttribute>() != null)
-                    .Select(p => p.Name.ToLowerInvariant());
-                
-                foreach (var prop in sensitiveProps)
-                {
-                    fieldsToMask.Add(prop);
-                }
-            }
+            var fieldsToMask = GetSensitiveFieldNames();
 
             // Если нет чувствительных полей, просто возвращаем исходный JSON
             if (fieldsToMask.Count == 0)
@@ -154,7 +273,7 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
                 writer.Flush();
                 return Encoding.UTF8.GetString(output.ToArray());
             }
-            catch 
+            catch (JsonException)
             {
                 // Если не удалось разобрать JSON, используем регулярные выражения
                 var maskedJson = json;
@@ -247,15 +366,8 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
         if (sensitiveFields.Contains(propertyName))
             return true;
             
-        // Проверяем, содержит ли имя свойства чувствительное слово
-        foreach (var sensitiveWord in DefaultSensitiveFields)
-        {
-            if (propertyName.Contains(sensitiveWord, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        
-        // Проверяем, содержит ли имя свойства слово "file" - это может быть IFormFile
-        if (propertyName.Contains("file", StringComparison.OrdinalIgnoreCase))
+        // Проверяем, есть ли свойство в списке стандартных чувствительных полей
+        if (DefaultSensitiveFields.Contains(propertyName))
             return true;
         
         return false;

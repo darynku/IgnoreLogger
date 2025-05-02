@@ -16,10 +16,7 @@ public class IgnoreLoggerDestructuringPolicy : IDestructuringPolicy
     // Поля, которые всегда будут игнорироваться, независимо от наличия атрибута
     private static readonly HashSet<string> DefaultSensitiveFields = new(StringComparer.OrdinalIgnoreCase)
     {
-        "password", "pwd", "secret", "key", "token", "apikey", "api_key", 
-        "accesstoken", "access_token", "refreshtoken", "refresh_token",
-        "credential", "pin", "passcode", "pass", "privatekey", "private_key",
-        "file", "files", "attachment", "upload", "document", "binary", "content", "stream"
+        "file", "files" // Оставляем только поля, связанные с файлами
     };
 
     public bool TryDestructure(object? value, ILogEventPropertyValueFactory propertyValueFactory, out LogEventPropertyValue result)
@@ -103,15 +100,8 @@ public class IgnoreLoggerDestructuringPolicy : IDestructuringPolicy
         if (classIgnoredProperties.Contains(propertyName))
             return true;
             
-        // Проверяем, содержит ли имя свойства чувствительное слово
-        foreach (var sensitiveWord in DefaultSensitiveFields)
-        {
-            if (propertyName.Contains(sensitiveWord, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        
-        // Проверяем, содержит ли имя свойства слово "file" - это может быть IFormFile
-        if (propertyName.Contains("file", StringComparison.OrdinalIgnoreCase))
+        // Проверяем, есть ли свойство в списке стандартных чувствительных полей
+        if (DefaultSensitiveFields.Contains(propertyName))
             return true;
         
         return false;
