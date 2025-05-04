@@ -15,8 +15,6 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 
-;
-
 var logger = new LoggerConfiguration()
     .WriteTo.Console()
     .WriteTo.Debug()
@@ -37,6 +35,23 @@ if (app.Environment.IsDevelopment())
 app.UseRouting();
 
 app.UseExceptionHandler();
+
+// Включаем буферизацию для запросов с JSON
+app.Use(async (context, next) =>
+{
+    // Определяем главный тип содержимого (до первого ';')
+    var contentType = context.Request.ContentType;
+    string? mainContentType = contentType?.Split(';').FirstOrDefault()?.Trim().ToLowerInvariant();
+    
+    var bufferableTypes = new[] { "application/json", "application/xml", "text/plain", "application/x-www-form-urlencoded" };
+    if (mainContentType != null && bufferableTypes.Contains(mainContentType))
+    {
+        context.Request.EnableBuffering();
+    }
+
+    
+    await next(context);
+});
 
 app.MapEndpoints();
 

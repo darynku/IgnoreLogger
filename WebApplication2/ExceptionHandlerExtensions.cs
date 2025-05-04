@@ -31,7 +31,7 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
         try
         {
             var request = httpContext.Request;
-            string? bodyContent = httpContext.Items["RawRequestBody"]?.ToString();
+            string? bodyContent;
             // Читаем тело запроса
             if (request.HasFormContentType)
             {
@@ -106,11 +106,6 @@ internal sealed class GlobalExceptionHandler : IExceptionHandler
 
     private static async Task<string?> ReadRequestBodyAsync(HttpRequest request) 
     {
-        if (!request.Body.CanRead)
-            return null;
-        
-        request.EnableBuffering();
-        
         try
         {
             request.Body.Position = 0;

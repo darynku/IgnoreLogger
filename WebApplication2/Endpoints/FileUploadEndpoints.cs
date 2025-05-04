@@ -13,10 +13,14 @@ public class FileUploadEndpoints : IEndpoint
         })
         .WithOpenApi();
         
-        app.MapPost("/upload-json", ([FromBody] BodyResponse bodyResponse, CancellationToken cancellationToken) =>
+        
+        app.MapPost("/upload-json", ([FromBody] BodyResponse bodyResponse, [FromQuery] int id, CancellationToken cancellationToken) =>
         {
             throw new Exception("Джсончик");
         })
+        .Accepts<BodyResponse>("application/json", "application/xml")
+        .Produces(StatusCodes.Status200OK)
+        .Produces(StatusCodes.Status500InternalServerError)
         .WithOpenApi();
     }
 } 
