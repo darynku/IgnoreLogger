@@ -1,5 +1,4 @@
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Routing;
 using WebApplication2.Models;
 
 namespace WebApplication2.Endpoints;
@@ -8,16 +7,15 @@ public class FileUploadEndpoints : IEndpoint
 {
     public void MapEndpoint(IEndpointRouteBuilder app)
     {
-        app.MapPost("/upload-file", async ([FromForm] TestDto test, CancellationToken cancellationToken) =>
+        app.MapPost("/upload-file", ([FromForm] Response formResponse, CancellationToken cancellationToken) =>
         {
-            throw new Exception();
+            throw new Exception("Мультформдата");
         })
         .WithOpenApi();
-
-        // Эндпоинт для тестирования с множеством файлов
-        app.MapPost("/upload-multiple", ([FromForm] UserProfile test, CancellationToken cancellationToken) =>
+        
+        app.MapPost("/upload-json", ([FromBody] BodyResponse bodyResponse, CancellationToken cancellationToken) =>
         {
-            throw new Exception();
+            throw new Exception("Джсончик");
         })
         .WithOpenApi();
     }
